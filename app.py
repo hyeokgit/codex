@@ -73,10 +73,6 @@ def historical_ps_pb_average(ticker: str, years: int = 5) -> Dict[str, Optional[
     if shares is None or shares <= 0:
         return {"priceToBook": None, "priceToSalesTrailing12Months": None}
 
-    # yfinance often returns timezone-aware DatetimeIndex for price history,
-    # while statement columns are timezone-naive datetimes. Normalize both to
-    # timezone-naive index before reindexing to avoid dtype comparison errors.
-    price.index = pd.DatetimeIndex(price.index).tz_localize(None)
     market_cap = price * shares
 
     q_fin = t.quarterly_financials
@@ -94,16 +90,14 @@ def historical_ps_pb_average(ticker: str, years: int = 5) -> Dict[str, Optional[
                 break
 
     if revenue is not None and not revenue.empty:
-        revenue.index = pd.DatetimeIndex(revenue.index).tz_localize(None)
-        rev_m = revenue.reindex(price.index, method="ffill")
+        rev_m = revenue.reindex(pd.to_datetime(price.index), method="ffill")
         ps = (market_cap / rev_m).replace([np.inf, -np.inf], np.nan).dropna()
         ps_avg = safe_float(ps.mean())
     else:
         ps_avg = None
 
     if equity is not None and not equity.empty:
-        equity.index = pd.DatetimeIndex(equity.index).tz_localize(None)
-        eq_m = equity.reindex(price.index, method="ffill")
+        eq_m = equity.reindex(pd.to_datetime(price.index), method="ffill")
         pb = (market_cap / eq_m).replace([np.inf, -np.inf], np.nan).dropna()
         pb_avg = safe_float(pb.mean())
     else:
