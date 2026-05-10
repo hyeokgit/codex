@@ -1,159 +1,195 @@
-import os
-import tempfile
-from typing import List
+import datetime as dt
+from typing import Dict, List, Optional
 
-import chromadb
-import fitz  # PyMuPDF
-import google.generativeai as genai
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-from sentence_transformers import SentenceTransformer
+import yfinance as yf
 
-# -----------------------------
-# Configuration
-# -----------------------------
-CHROMA_DIR = "./chroma_data"
-COLLECTION_NAME = "local_docs"
-EMBED_MODEL_NAME = "BAAI/bge-m3"
-TOP_K = 5
-
-
-@st.cache_resource(show_spinner=False)
-def get_embedder() -> SentenceTransformer:
-    return SentenceTransformer(EMBED_MODEL_NAME)
+VALUATION_FIELDS = {
+    "trailingPE": "Trailing P/E",
+    "forwardPE": "Forward P/E",
+    "priceToBook": "P/B",
+    "priceToSalesTrailing12Months": "P/S",
+    "enterpriseToRevenue": "EV/Revenue",
+    "enterpriseToEbitda": "EV/EBITDA",
+}
 
 
-@st.cache_resource(show_spinner=False)
-def get_chroma_collection():
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
-
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
+def safe_float(value) -> Optional[float]:
     try:
-        doc = fitz.open(tmp_path)
-        full_text = []
-        for page in doc:
-            full_text.append(page.get_text("text"))
-        return "\n".join(full_text).strip()
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if value is None:
+            return None
+        v = float(value)
+        if np.isfinite(v):
+            return v
+    except Exception:
+        return None
+    return None
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return [c for c in chunks if c.strip()]
+def get_current_multiples(ticker: str) -> Dict[str, Optional[float]]:
+    info = yf.Ticker(ticker).get_info()
+    return {k: safe_float(info.get(k)) for k in VALUATION_FIELDS}
 
 
-def index_pdf(filename: str, file_bytes: bytes):
-    text = extract_text_from_pdf(file_bytes)
-    if not text:
-        raise ValueError("PDF에서 텍스트를 추출하지 못했습니다.")
-
-    chunks = chunk_text(text)
-    embedder = get_embedder()
-    vectors = embedder.encode(chunks, normalize_embeddings=True).tolist()
-
-    ids = [f"{filename}-{i}" for i in range(len(chunks))]
-    metadatas = [{"source": filename, "chunk": i} for i in range(len(chunks))]
-
-    collection = get_chroma_collection()
-    collection.upsert(ids=ids, documents=chunks, embeddings=vectors, metadatas=metadatas)
-
-    return len(chunks)
+def derive_peers(ticker: str, manual_peers: List[str], limit: int = 6) -> List[str]:
+    base = ticker.upper().strip()
+    peers = [p.upper().strip() for p in manual_peers if p.strip()]
+    peers = [p for p in peers if p != base]
+    return peers[:limit]
 
 
-def retrieve_context(question: str, k: int = TOP_K) -> List[str]:
-    embedder = get_embedder()
-    q_vector = embedder.encode([question], normalize_embeddings=True).tolist()[0]
+def fetch_peer_average(peer_tickers: List[str]) -> Dict[str, Optional[float]]:
+    if not peer_tickers:
+        return {k: None for k in VALUATION_FIELDS}
 
-    collection = get_chroma_collection()
-    result = collection.query(query_embeddings=[q_vector], n_results=k)
+    rows = []
+    for p in peer_tickers:
+        try:
+            rows.append(get_current_multiples(p))
+        except Exception:
+            continue
 
-    docs = result.get("documents", [[]])[0]
-    return docs
+    if not rows:
+        return {k: None for k in VALUATION_FIELDS}
+
+    df = pd.DataFrame(rows)
+    return {c: safe_float(df[c].mean(skipna=True)) for c in df.columns}
 
 
-def ask_gemini(question: str, contexts: List[str]) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY 환경 변수를 설정해주세요.")
+def historical_ps_pb_average(ticker: str, years: int = 5) -> Dict[str, Optional[float]]:
+    t = yf.Ticker(ticker)
+    end = dt.date.today()
+    start = dt.date(end.year - years, end.month, end.day)
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    price = t.history(start=start, end=end, interval="1mo", auto_adjust=False)["Close"].dropna()
+    if price.empty:
+        return {"priceToBook": None, "priceToSalesTrailing12Months": None}
 
-    context_text = "\n\n".join(contexts)
-    prompt = f"""
-너는 로컬 RAG 시스템의 답변 어시스턴트다.
-아래 [문맥]만 근거로 답하고, 근거가 부족하면 모른다고 답해.
+    info = t.get_info()
+    shares = safe_float(info.get("sharesOutstanding"))
+    if shares is None or shares <= 0:
+        return {"priceToBook": None, "priceToSalesTrailing12Months": None}
 
-[문맥]
-{context_text}
+    market_cap = price * shares
 
-[질문]
-{question}
-""".strip()
+    q_fin = t.quarterly_financials
+    q_bs = t.quarterly_balance_sheet
 
-    response = model.generate_content(prompt)
-    return response.text
+    revenue = None
+    equity = None
+    if not q_fin.empty and "Total Revenue" in q_fin.index:
+        rev = q_fin.loc["Total Revenue"].sort_index()
+        revenue = rev.rolling(4).sum().dropna()
+    if not q_bs.empty:
+        for key in ["Stockholders Equity", "Total Equity Gross Minority Interest", "Total Stockholder Equity"]:
+            if key in q_bs.index:
+                equity = q_bs.loc[key].sort_index().dropna()
+                break
+
+    if revenue is not None and not revenue.empty:
+        rev_m = revenue.reindex(pd.to_datetime(price.index), method="ffill")
+        ps = (market_cap / rev_m).replace([np.inf, -np.inf], np.nan).dropna()
+        ps_avg = safe_float(ps.mean())
+    else:
+        ps_avg = None
+
+    if equity is not None and not equity.empty:
+        eq_m = equity.reindex(pd.to_datetime(price.index), method="ffill")
+        pb = (market_cap / eq_m).replace([np.inf, -np.inf], np.nan).dropna()
+        pb_avg = safe_float(pb.mean())
+    else:
+        pb_avg = None
+
+    return {"priceToBook": pb_avg, "priceToSalesTrailing12Months": ps_avg}
+
+
+def build_comparison_df(current, hist, peers):
+    rows = []
+    for field, label in VALUATION_FIELDS.items():
+        rows.append(
+            {
+                "Metric": label,
+                "Current": current.get(field),
+                "Historical Avg (5Y)": hist.get(field),
+                "Peers Avg": peers.get(field),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def plot_comparison(df: pd.DataFrame, ticker: str):
+    fig = go.Figure()
+    for col in ["Current", "Historical Avg (5Y)", "Peers Avg"]:
+        fig.add_trace(
+            go.Bar(
+                x=df["Metric"],
+                y=df[col],
+                name=col,
+                text=[f"{v:.2f}" if pd.notna(v) else "N/A" for v in df[col]],
+                textposition="outside",
+            )
+        )
+
+    fig.update_layout(
+        barmode="group",
+        title=f"{ticker.upper()} 밸류에이션 비교",
+        xaxis_title="지표",
+        yaxis_title="배수(Multiple)",
+        legend_title="비교 기준",
+        height=560,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    return fig
 
 
 def main():
-    st.set_page_config(page_title="Local-First RAG", layout="wide")
-    st.title("📚 Local-First RAG (Gemini + Local Embedding + Chroma)")
-    st.caption("파일은 로컬에서 처리하고, 정제된 문맥만 Gemini API로 전송합니다.")
+    st.set_page_config(page_title="미국 주식 밸류에이션 대시보드", layout="wide")
+    st.title("📊 미국 주식 밸류에이션 대시보드 (Yahoo Finance)")
+    st.caption("티커 입력 후 현재 밸류에이션을 5년 평균과 경쟁사 평균과 비교합니다.")
 
-    with st.sidebar:
-        st.header("설정")
-        st.write(f"Embedding: `{EMBED_MODEL_NAME}`")
-        st.write(f"Vector DB: `ChromaDB` ({CHROMA_DIR})")
-        st.write("LLM: `gemini-2.5-flash` (API 호출)")
+    col1, col2 = st.columns([2, 3])
+    with col1:
+        ticker = st.text_input("미국 상장 티커", value="AAPL").strip().upper()
+        peer_input = st.text_input(
+            "경쟁사 티커(쉼표 구분, 비워두면 직접 입력 필요)",
+            value="MSFT,GOOGL,AMZN,META",
+        )
+        run = st.button("분석 실행", type="primary")
 
-    uploaded_files = st.file_uploader(
-        "PDF 파일 업로드",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
+    with col2:
+        st.markdown(
+            "- 현재값: Yahoo Finance의 최신 지표\n"
+            "- 5년 평균: 월별 시가총액/분기 재무데이터 기반 추정(P/B, P/S만 제공)\n"
+            "- 경쟁사 평균: 입력한 동종 티커 평균"
+        )
 
-    if st.button("로컬 인덱싱 시작"):
-        if not uploaded_files:
-            st.warning("업로드된 파일이 없습니다.")
-        else:
-            with st.spinner("PDF 처리 및 임베딩 생성 중..."):
-                total_chunks = 0
-                for f in uploaded_files:
-                    chunk_count = index_pdf(f.name, f.read())
-                    total_chunks += chunk_count
-            st.success(f"인덱싱 완료: {len(uploaded_files)}개 파일, {total_chunks}개 청크 저장")
+    if run and ticker:
+        with st.spinner("데이터 불러오는 중..."):
+            manual_peers = [x.strip() for x in peer_input.split(",") if x.strip()]
+            peers = derive_peers(ticker, manual_peers)
 
-    st.divider()
-    question = st.text_input("질문을 입력하세요")
+            current = get_current_multiples(ticker)
+            hist_extra = historical_ps_pb_average(ticker, years=5)
+            hist = {k: None for k in VALUATION_FIELDS}
+            hist.update(hist_extra)
+            peer_avg = fetch_peer_average(peers)
 
-    if st.button("질문하기") and question.strip():
-        with st.spinner("로컬 검색 + Gemini 답변 생성 중..."):
-            contexts = retrieve_context(question, TOP_K)
-            if not contexts:
-                st.error("검색된 문맥이 없습니다. 먼저 문서를 인덱싱하세요.")
-                return
+            df = build_comparison_df(current, hist, peer_avg)
 
-            answer = ask_gemini(question, contexts)
+        st.subheader(f"{ticker} 밸류에이션 비교표")
+        st.dataframe(df, use_container_width=True)
 
-        st.subheader("답변")
-        st.write(answer)
+        fig = plot_comparison(df, ticker)
+        st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("검색된 문맥 보기"):
-            for i, c in enumerate(contexts, start=1):
-                st.markdown(f"**Context {i}**")
-                st.write(c)
+        missing_hist = df[df["Historical Avg (5Y)"].isna()]["Metric"].tolist()
+        if missing_hist:
+            st.info(f"5년 평균 데이터 부재: {', '.join(missing_hist)}")
+
+        st.caption(f"경쟁사 티커: {', '.join(peers) if peers else '없음'}")
 
 
 if __name__ == "__main__":
