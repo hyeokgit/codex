@@ -1,5 +1,5 @@
 streamlit
-chromadb
-sentence-transformers
-PyMuPDF
-google-generativeai
+yfinance
+pandas
+numpy
+plotly
