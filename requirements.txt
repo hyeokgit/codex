@@ -3,6 +3,5 @@ yfinance
 pandas
 numpy
 plotly
-
-OpenDartReader
+dart-fss
 google-generativeai
